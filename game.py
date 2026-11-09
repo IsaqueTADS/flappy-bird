@@ -1,21 +1,24 @@
-"""Flappy Bird: standalone pixel-art game using only Python's standard library."""
+"""Flappy Bird: pixel art, procedural audio and a standalone Windows build."""
 from __future__ import annotations
 
 import argparse
-import json
 import math
-import os
 from pathlib import Path
 import random
+import sys
+import tempfile
 import time
 import tkinter as tk
+
+from audio import Audio
+from storage import PlayerData
 
 WIDTH, HEIGHT, GROUND = 288, 512, 400
 GRAVITY, FLAP, SPEED = 850.0, -265.0, 105.0
 PIPE_WIDTH, GAP, SPACING = 52, 112, 170
 BIRD_X, BIRD_RADIUS = 78, 10
 ROOT = Path(__file__).resolve().parent
-SAVE_FILE = ROOT / "data" / "record.json"
+VERSION = "0.2.0"
 
 
 class World:
@@ -113,22 +116,27 @@ GLYPHS = {
 
 
 class Game:
-    def __init__(self, window):
+    def __init__(self, window, data=None, audio_enabled=True):
         self.window = window
         self.scale = min(1.5, (window.winfo_screenheight() - 130) / HEIGHT)
         self.canvas = tk.Canvas(window, width=round(WIDTH * self.scale), height=round(HEIGHT * self.scale), bg="#70c5ce", highlightthickness=0)
         self.canvas.pack()
-        window.title("Flappy Bird")
+        window.title(f"Flappy Bird · {VERSION}")
         window.resizable(False, False)
         self.world = World()
         self.state, self.paused = "ready", False
         self.elapsed, self.ground_offset = 0.0, 0.0
         self.death_time, self.flash_until = 0.0, 0.0
-        self.best = self.load_best()
+        self.data = data if data is not None else PlayerData(legacy=ROOT / "data" / "record.json")
+        self.best = self.data.best
         self.save_error = False
         self.sprites = {}
         self.button = None
         self.background()
+        self.audio = Audio(self.data.music, self.data.effects, enabled=audio_enabled)
+        self.icon = self.bird_image(1, 0)
+        window.iconphoto(True, self.icon)
+        window.protocol("WM_DELETE_WINDOW", self.close)
         window.bind("<space>", self.action)
         window.bind("<Up>", self.action)
         window.bind("<Button-1>", self.click)
@@ -138,25 +146,28 @@ class Game:
         window.bind("<Key-P>", self.pause)
         window.bind("<Escape>", self.pause)
         window.bind("<FocusOut>", self.focus_out)
+        for key in ("m", "M"):
+            window.bind(f"<Key-{key}>", self.toggle_music)
+        for key in ("e", "E"):
+            window.bind(f"<Key-{key}>", self.toggle_effects)
         self.last = time.perf_counter()
         self.render()
         window.after(16, self.tick)
 
-    def load_best(self):
-        try:
-            value = json.loads(SAVE_FILE.read_text(encoding="utf-8")).get("best", 0)
-            return max(0, value) if type(value) is int else 0
-        except (OSError, ValueError, AttributeError):
-            return 0
-
     def save_best(self):
-        try:
-            SAVE_FILE.parent.mkdir(exist_ok=True)
-            temporary = SAVE_FILE.with_suffix(".tmp")
-            temporary.write_text(json.dumps({"best": self.best}), encoding="utf-8")
-            os.replace(temporary, SAVE_FILE)
-        except OSError:
-            self.save_error = True
+        self.save_error = not self.data.save_record(self.best)
+
+    def toggle_music(self, event=None):
+        self.audio.toggle_music()
+        self.data.save_settings(self.audio.music_enabled, self.audio.effects_enabled)
+
+    def toggle_effects(self, event=None):
+        self.audio.toggle_effects()
+        self.data.save_settings(self.audio.music_enabled, self.audio.effects_enabled)
+
+    def close(self):
+        self.audio.close()
+        self.window.destroy()
 
     def rect(self, x1, y1, x2, y2, color, tag="dynamic", outline="", width=1):
         s = self.scale
@@ -256,12 +267,22 @@ class Game:
         elif self.state == "ready":
             self.state = "playing"
             self.world.flap()
+            self.audio.effect("flap")
         elif self.state == "playing":
             self.world.flap()
+            self.audio.effect("flap")
         elif time.perf_counter()-self.death_time > 0.65:
             self.restart()
 
     def click(self, event):
+        x, y = event.x/self.scale, event.y/self.scale
+        if 479 <= y <= 503:
+            if 12 <= x <= 140:
+                self.toggle_music()
+                return
+            if 148 <= x <= 276:
+                self.toggle_effects()
+                return
         if self.state == "over":
             if self.button:
                 x1, y1, x2, y2 = self.button
@@ -276,14 +297,18 @@ class Game:
         self.world.reset()
         self.state, self.paused = "ready", False
         self.button = None
+        self.audio.set_paused(False)
+        self.audio.start_music()
 
     def pause(self, event=None):
         if self.state == "playing":
             self.paused = not self.paused
+            self.audio.set_paused(self.paused)
 
     def focus_out(self, event):
         if self.state == "playing":
             self.paused = True
+            self.audio.set_paused(True)
 
     def tick(self):
         now = time.perf_counter()
@@ -294,6 +319,7 @@ class Game:
             if self.state != "over":
                 self.ground_offset = (self.ground_offset+SPEED*dt) % 24
             if self.state == "playing":
+                previous_score = self.world.score
                 # Small physics steps keep collision checks reliable after a slow frame.
                 remaining = dt
                 while remaining > 0 and not self.world.dead:
@@ -304,10 +330,13 @@ class Game:
                     self.state = "over"
                     self.death_time = now
                     self.flash_until = now+0.09
+                    self.audio.die()
                     self.new_best = self.world.score > self.best
                     if self.new_best:
                         self.best = self.world.score
                         self.save_best()
+                elif self.world.score > previous_score:
+                    self.audio.effect("point")
             elif self.state == "over" and self.world.y < GROUND-12:
                 self.world.velocity += GRAVITY*dt
                 self.world.y = min(GROUND-12, self.world.y+max(0, self.world.velocity)*dt)
@@ -374,6 +403,13 @@ class Game:
             self.text(144, 338, "JOGAR DE NOVO", 10)
             self.text(144, 378, "ESPAÇO ou R para reiniciar", 9, "#38676b")
             self.text(144, 459, "Recorde indisponível para salvar" if self.save_error else "MAIS UM VOO?", 8, "#8b7950")
+        if self.audio.available:
+            self.rect(12, 479, 140, 503, "#d1ca88")
+            self.rect(148, 479, 276, 503, "#d1ca88")
+            self.text(76, 491, f"M · MÚSICA {'ON' if self.audio.music_enabled else 'OFF'}", 8, "#675635")
+            self.text(212, 491, f"E · EFEITOS {'ON' if self.audio.effects_enabled else 'OFF'}", 8, "#675635")
+        else:
+            self.text(144, 491, "ÁUDIO INDISPONÍVEL", 8, "#8b7950")
         if self.paused:
             self.rect(38, 172, 250, 270, "#543f33")
             self.rect(41, 175, 247, 267, "#ded895")
@@ -386,28 +422,70 @@ class Game:
 def main():
     parser = argparse.ArgumentParser(description="Flappy Bird em Python — espaço ou clique para voar.")
     parser.add_argument("--smoke-test", action="store_true", help="Abre a janela, verifica as telas e fecha automaticamente.")
+    parser.add_argument("--no-audio", action="store_true", help="Executa sem inicializar o dispositivo de áudio.")
+    parser.add_argument("--data-dir", type=Path, help="Diretório alternativo para recorde e preferências.")
+    parser.add_argument("--smoke-report", type=Path, help="Salva o resultado do teste de interface em JSON.")
     args = parser.parse_args()
+    test_directory = tempfile.TemporaryDirectory() if args.smoke_test and args.data_dir is None else None
+    data_dir = args.data_dir or (Path(test_directory.name) if test_directory else None)
+    legacy_root = Path(sys.executable).parent if getattr(sys, "frozen", False) else ROOT
+    data = PlayerData(data_dir, legacy=None if args.smoke_test else legacy_root / "data" / "record.json")
     window = tk.Tk()
-    game = Game(window)
+    game = Game(window, data, audio_enabled=not args.no_audio)
+    failures = []
     if args.smoke_test:
+        import json
+
         def check():
-            game.action()
-            game.world.step(1/60)
-            game.render()
-            game.pause()
-            game.render()
-            game.paused = False
-            game.state = "over"
-            game.death_time = time.perf_counter()-1
-            game.world.score = 12
-            game.render()
-            window.update_idletasks()
-            game.restart()
-            game.render()
-            print("OK: janela, sprites, jogo, pausa, resultado e reinicio.")
-            window.destroy()
+            report = {"version": VERSION, "frozen": bool(getattr(sys, "frozen", False)),
+                      "audio": game.audio.available, "audio_backend": game.audio.backend, "audio_error": game.audio.error}
+            try:
+                game.action()
+                game.world.step(1/60)
+                game.render()
+                assert game.state == "playing"
+                game.pause()
+                game.render()
+                assert game.paused
+                game.action()
+                assert not game.paused
+                game.audio.effect("point")
+                game.toggle_music()
+                game.toggle_music()
+                game.toggle_effects()
+                game.toggle_effects()
+                game.audio.die()
+                game.state = "over"
+                game.death_time = time.perf_counter()-1
+                game.world.score = 12
+                game.render()
+                window.update_idletasks()
+                game.best = max(12, game.best)
+                game.save_best()
+                assert PlayerData(data.directory).best == game.best
+                game.restart()
+                game.render()
+                assert game.state == "ready" and game.world.score == 0
+                report["ok"] = True
+            except Exception as error:
+                failures.append(str(error))
+                report.update(ok=False, error=repr(error))
+            finally:
+                if args.smoke_report:
+                    args.smoke_report.parent.mkdir(parents=True, exist_ok=True)
+                    args.smoke_report.write_text(json.dumps(report, indent=2), encoding="utf-8")
+                if sys.stdout is not None:
+                    print(json.dumps(report, indent=2))
+                game.close()
         window.after(300, check)
-    window.mainloop()
+    try:
+        window.mainloop()
+    finally:
+        game.audio.close()
+        if test_directory:
+            test_directory.cleanup()
+    if failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
